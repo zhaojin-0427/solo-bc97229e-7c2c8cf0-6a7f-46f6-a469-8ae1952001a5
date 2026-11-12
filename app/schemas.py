@@ -1,36 +1,32 @@
-"""Request/response models for the scan-time normalization API."""
+"""Request/response models for the scan lakehouse ingestion API."""
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Literal
+import hashlib
+import json
+from datetime import datetime, timezone
+from typing import Any, Literal
+
+from pydantic import AwareDatetime, BaseModel, Field, field_validator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+MAX_BATCH_RECORDS = 200
 
 
-class ScanRecord(BaseModel):
-    """One carrier scan event: unique id + naive local time + IANA timezone."""
+class AirportRegister(BaseModel):
+    """Register an airport with its IANA timezone."""
 
-    id: str = Field(min_length=1, max_length=64, examples=["ARR_JFK"])
-    local_time: datetime = Field(
-        examples=["2024-11-03T01:30:00"],
-        description="Naive local date-time, whole-second precision, no UTC offset.",
-    )
+    code: str = Field(min_length=1, max_length=16, pattern=r"^[A-Za-z0-9_]+$", examples=["JFK"])
     timezone: str = Field(
         min_length=1, max_length=64,
         examples=["America/New_York"],
         description="IANA timezone name, e.g. America/New_York.",
     )
 
-    @field_validator("local_time")
+    @field_validator("code")
     @classmethod
-    def _naive_whole_second(cls, v: datetime) -> datetime:
-        if v.tzinfo is not None:
-            raise ValueError("local_time must be naive local time without a UTC offset")
-        if v.microsecond != 0:
-            raise ValueError("local_time must have whole-second precision")
-        return v
+    def _upper_code(cls, v: str) -> str:
+        return v.upper()
 
     @field_validator("timezone")
     @classmethod
@@ -42,85 +38,129 @@ class ScanRecord(BaseModel):
         return v
 
 
-class TransferLink(BaseModel):
-    """A leg/transfer connection: UTC duration from_id -> to_id in [min, max] seconds."""
+class ScanIn(BaseModel):
+    """One carrier-confirmed scan event: unique id + UTC instant + payload."""
 
-    from_id: str = Field(min_length=1, max_length=64, examples=["ARR_JFK"])
-    to_id: str = Field(min_length=1, max_length=64, examples=["DEP_JFK"])
-    min_seconds: int = Field(ge=0, examples=[3600])
-    max_seconds: int = Field(ge=0, examples=[7200])
+    id: str = Field(min_length=1, max_length=128, examples=["AWB-7842-1"])
+    utc_ts: AwareDatetime = Field(
+        examples=["2024-11-03T06:30:00Z"],
+        description="Carrier-confirmed UTC instant; a timezone offset (Z or +hh:mm) is required.",
+    )
+    event_type: str = Field(default="SCAN", min_length=1, max_length=32, examples=["DEP"])
+    location: str | None = Field(default=None, max_length=64, examples=["JFK-T4-G17"])
+    attributes: dict[str, Any] = Field(default_factory=dict)
 
-    @model_validator(mode="after")
-    def _ordered_interval(self) -> "TransferLink":
-        if self.min_seconds > self.max_seconds:
-            raise ValueError("min_seconds must be <= max_seconds")
-        return self
+    def canonical(self) -> dict[str, Any]:
+        """Stable JSON representation used for content-hash / idempotency checks."""
+        return {
+            "id": self.id,
+            "utc_ts": self.utc_ts.astimezone(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "event_type": self.event_type,
+            "location": self.location,
+            "attributes": self.attributes,
+        }
+
+    def content_hash(self) -> str:
+        blob = json.dumps(
+            self.canonical(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
 
 
-class NormalizeRequest(BaseModel):
-    records: list[ScanRecord] = Field(min_length=1, max_length=200)
-    links: list[TransferLink] = Field(default_factory=list, max_length=400)
+class IngestRequest(BaseModel):
+    """A batch of at most 200 scans for one airport."""
 
-    @model_validator(mode="after")
-    def _consistent_references(self) -> "NormalizeRequest":
-        ids = [r.id for r in self.records]
+    airport: str = Field(min_length=1, max_length=16, examples=["JFK"])
+    records: list[ScanIn] = Field(min_length=1, max_length=MAX_BATCH_RECORDS)
+
+    @field_validator("airport")
+    @classmethod
+    def _upper(cls, v: str) -> str:
+        return v.upper()
+
+    @field_validator("records")
+    @classmethod
+    def _unique_ids_within_batch(cls, v: list[ScanIn]) -> list[ScanIn]:
+        ids = [r.id for r in v]
         if len(set(ids)) != len(ids):
             dupes = sorted({i for i in ids if ids.count(i) > 1})
-            raise ValueError(f"duplicate record id(s): {', '.join(dupes)}")
-        known = set(ids)
-        unknown = sorted(({l.from_id for l in self.links} | {l.to_id for l in self.links}) - known)
-        if unknown:
-            raise ValueError(f"link(s) reference unknown record id(s): {', '.join(unknown)}")
-        return self
+            raise ValueError(f"duplicate scan id(s) within batch: {', '.join(dupes)}")
+        return v
 
 
-class RecordOut(BaseModel):
-    id: str
+class AirportOut(BaseModel):
+    code: str
     timezone: str
-    local_time: datetime
-    status: Literal["determined", "needs_review"] = Field(
-        description="determined = exactly one feasible UTC instant (确定); "
-                    "needs_review = several feasible instants, none picked (待核对)."
-    )
-    utc: datetime | None = Field(
-        default=None, description="The single feasible UTC instant; null unless determined."
-    )
-    candidates: list[datetime] = Field(
-        description="All UTC instants that appear in at least one globally feasible "
-                    "interpretation, sorted ascending."
-    )
+    current_version: int
+    created_at: datetime
+    updated_at: datetime
 
 
-class Summary(BaseModel):
-    total: int
-    determined: int
-    needs_review: int
-
-
-class NormalizeResponse(BaseModel):
-    status: Literal["ok"] = "ok"
-    summary: Summary
-    records: list[RecordOut]
-
-
-class InvalidRecordInfo(BaseModel):
-    id: str
-    local_time: datetime
+class LakeFileOut(BaseModel):
+    file_id: int
+    version: int
     timezone: str
-    reason: str
+    local_date: str
+    relative_path: str
+    row_count: int
+    size_bytes: int
+    sha256: str
+    source: Literal["ingest", "repartition"]
+    created_at: datetime
 
 
-class LinkInfo(BaseModel):
-    index: int
-    from_id: str
-    to_id: str
-    min_seconds: int
-    max_seconds: int
+class ManifestOut(BaseModel):
+    manifest_id: int
+    airport: str
+    version: int
+    timezone: str
+    revision: int
+    status: Literal["current", "superseded"]
+    file_count: int
+    row_count: int
+    files: list[LakeFileOut]
+    published_at: datetime
+
+
+class IngestResponse(BaseModel):
+    status: Literal["accepted", "duplicate"]
+    batch_id: int
+    airport: str
+    version: int
+    timezone: str
+    received: int
+    inserted: int
+    duplicates: int
+    manifest: ManifestOut
+
+
+class RepartitionJobOut(BaseModel):
+    job_id: int
+    airport: str
+    from_timezone: str
+    to_timezone: str
+    new_version: int
+    state: Literal["pending", "running", "draining", "publishing", "done", "failed"]
+    total_rows: int
+    processed_rows: int
+    chunks_done: int
+    drained_rows: int
+    error: str | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class ProgressOut(BaseModel):
+    airport: AirportOut
+    active_job: RepartitionJobOut | None
+    total_scans: int
+    current_manifest: ManifestOut
 
 
 class ErrorResponse(BaseModel):
-    error: Literal["no_legal_candidate", "no_global_solution"]
+    error: str
     message: str
-    invalid_records: list[InvalidRecordInfo] = Field(default_factory=list)
-    conflicting_links: list[LinkInfo] = Field(default_factory=list)
-    involved_records: list[str] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)

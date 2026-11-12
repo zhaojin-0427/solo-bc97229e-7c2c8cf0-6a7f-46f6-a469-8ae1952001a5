@@ -1,9 +1,24 @@
-name: scan-time-normalizer
+name: scan-lakehouse
 
 services:
   api:
     build: .
-    image: scan-time-normalizer:latest
+    image: scan-lakehouse:latest
     ports:
       - "8000:8000"
+    environment:
+      # All state (SQLite + Parquet lake) lives under /data and survives restarts.
+      LAKE_DB_PATH: /data/db/scan_lake.db
+      LAKE_ROOT: /data/lake
+    volumes:
+      - scan_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  scan_data:

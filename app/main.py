@@ -1,186 +1,404 @@
-"""FastAPI entrypoint for the scan-time normalization service."""
+"""FastAPI entrypoint for the airport scan lakehouse ingestion service."""
 
 from __future__ import annotations
 
-from typing import Annotated
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Annotated, Literal
 
-from fastapi import Body, FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI, HTTPException, Path, Query
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, Field
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import solver
+from . import service, storage
+from .database import db
 from .schemas import (
+    AirportOut,
+    AirportRegister,
     ErrorResponse,
-    InvalidRecordInfo,
-    LinkInfo,
-    NormalizeRequest,
-    NormalizeResponse,
-    RecordOut,
-    Summary,
+    IngestRequest,
+    IngestResponse,
+    ManifestOut,
+    ProgressOut,
+    RepartitionJobOut,
 )
 
 DESCRIPTION = """
-Normalize carrier-exported local scan times to UTC under IANA timezone rules.
+航空货运扫描入湖服务（Scan Lakehouse）
 
-* Each record's local time yields **0, 1 or 2 legal UTC candidates**
-  (DST fall-back duplicates a local time; spring-forward makes one nonexistent).
-* Transfer links constrain the UTC duration between two records to a closed
-  interval; **all links must hold simultaneously** and links may share records.
-* The service computes, per record, **every candidate that appears in at least
-  one globally feasible interpretation**:
-  * exactly one → `determined` (确定), returned as `utc`;
-  * several → `needs_review` (待核对), all candidates returned, none picked.
-* If any record has no legal candidate, or the links are mutually inconsistent,
-  the request fails with **HTTP 409** and a precise reason — no partial
-  conversion is ever returned.
+承运商已确认 **UTC** 的扫描事件按机场 IANA 时区换算成本地日，写成
+**按 `local_date` 分区的 Parquet**，供下游装载扫描事实表。
+
+关键保证
+--------
+* 每批最多 **200 条**扫描，含唯一 ID 与 UTC 时刻；原始记录先落 **SQLite**；
+* 同机场同 ID **同内容**重传 → 幂等，不重复落湖；**异内容** → 整批拒绝（409），一条不写；
+* 接收成功即同步发布新清单，下游马上能从**当前文件清单**读到整批数据；
+* 调整机场时区会创建后台**重分区作业**：重写全部历史扫描到新版本，期间
+  - 仍可正常接收扫描（写入旧版本，旧清单继续可读）；
+  - 切换前 drain 阶段把期间接收的扫描也纳入新版本，**每条恰好一次**（Parquet row_id 校验）；
+* **文件写完并 fsync 后才登记、才发布清单**；一次清单只包含同一时区口径的文件；
+* 写文件 / 切换时进程被杀死，重启后自动恢复，不漏数、不发布残缺文件；
+* 同机场重分区进行中再次调整时区 → **409 拒绝**；
+* 提供作业进度、清单查询、文件下载（`preserve` 保留版本路径 / `normalize` 平铺为
+  `local_date=…` 规范分区布局）。
 """
 
-DEMO_DST_FALLBACK = {
+DEMO_INGEST = {
+    "airport": "JFK",
     "records": [
-        {"id": "ARR_JFK", "local_time": "2024-11-03T01:30:00", "timezone": "America/New_York"},
-        {"id": "DEP_JFK", "local_time": "2024-11-03T02:45:00", "timezone": "America/New_York"},
-        {"id": "ARR_ORD", "local_time": "2024-11-03T04:10:00", "timezone": "America/Chicago"},
-        {"id": "DEP_LAX", "local_time": "2024-11-03T03:20:00", "timezone": "America/Los_Angeles"},
-        {"id": "XFR_ORD", "local_time": "2024-11-03T01:30:00", "timezone": "America/Chicago"},
-    ],
-    "links": [
-        {"from_id": "ARR_JFK", "to_id": "DEP_JFK", "min_seconds": 3600, "max_seconds": 7200},
-        {"from_id": "DEP_JFK", "to_id": "ARR_ORD", "min_seconds": 7200, "max_seconds": 10800},
-        {"from_id": "ARR_ORD", "to_id": "DEP_LAX", "min_seconds": 1800, "max_seconds": 7200},
-        {"from_id": "ARR_JFK", "to_id": "XFR_ORD", "min_seconds": 0, "max_seconds": 86400},
+        {
+            "id": "AWB-001-DEP",
+            "utc_ts": "2024-11-03T06:30:00Z",
+            "event_type": "DEP",
+            "location": "JFK-T4-G17",
+            "attributes": {"flight": "CA982", "weight_kg": 1240.5},
+        },
+        {
+            # 05:00Z -> 00:00 New York local on 2024-11-04 (next local day).
+            "id": "AWB-001-ARR",
+            "utc_ts": "2024-11-04T05:00:00Z",
+            "event_type": "ARR",
+            "location": "PVG-P2",
+            "attributes": {"flight": "CA982"},
+        },
+        {
+            "id": "AWB-002-XFR",
+            "utc_ts": "2024-11-03T11:00:00.500000+00:00",
+            "event_type": "XFR",
+            "attributes": {},
+        },
     ],
 }
 
-DEMO_IMAGINARY_TIME = {
-    "records": [
-        {"id": "GAP_1", "local_time": "2024-03-10T02:30:00", "timezone": "America/New_York"},
-    ],
-    "links": [],
-}
+DEMO_TZ_CHANGE = {"timezone": "America/Chicago"}
 
-DEMO_CONFLICTING_LINKS = {
-    "records": [
-        {"id": "A", "local_time": "2024-06-01T10:00:00", "timezone": "UTC"},
-        {"id": "B", "local_time": "2024-06-01T12:00:00", "timezone": "UTC"},
-    ],
-    "links": [
-        {"from_id": "A", "to_id": "B", "min_seconds": 0, "max_seconds": 3600},
-    ],
-}
+
+class TimezoneChange(BaseModel):
+    timezone: str = Field(
+        min_length=1, max_length=64,
+        examples=["America/Chicago"],
+        description="New IANA timezone name.",
+    )
+
+    def validated(self) -> str:
+        try:
+            ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
+            raise HTTPException(
+                status_code=422, detail=f"unknown IANA timezone: {self.timezone!r}"
+            ) from exc
+        return self.timezone
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.connect()
+    recovery = await service.recover_on_startup()
+    app.state.recovery = recovery
+    worker = asyncio.create_task(service.worker_loop())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+        await db.close()
+
 
 app = FastAPI(
-    title="Scan Time Normalizer",
+    title="Airport Scan Lakehouse",
     description=DESCRIPTION,
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 
 @app.get("/", include_in_schema=False)
 def root() -> dict:
     return {
-        "service": "scan-time-normalizer",
+        "service": "scan-lakehouse",
         "docs": "/docs",
-        "normalize": "POST /normalize",
         "health": "/healthz",
+        "endpoints": {
+            "register_airport": "POST /airports",
+            "ingest": "POST /ingest",
+            "change_timezone": "PATCH /airports/{code}/timezone",
+            "progress": "GET /airports/{code}/progress",
+            "manifests": "GET /airports/{code}/manifests",
+            "download": "GET /airports/{code}/download",
+        },
     }
 
 
 @app.get("/healthz", tags=["meta"])
-def healthz() -> dict:
-    return {"status": "up"}
+async def healthz() -> dict:
+    row = await db.query_one("SELECT COUNT(*) AS n FROM airports")
+    return {"status": "up", "airports": row["n"] if row else 0}
+
+
+# ---------------------------------------------------------------------------
+# Airports
+# ---------------------------------------------------------------------------
 
 
 @app.post(
-    "/normalize",
-    response_model=NormalizeResponse,
-    responses={409: {"model": ErrorResponse, "description": "No legal candidate or no global solution"}},
-    tags=["normalize"],
+    "/airports",
+    response_model=AirportOut,
+    status_code=201,
+    tags=["airports"],
+    responses={409: {"model": ErrorResponse}},
+    summary="登记机场及 IANA 时区",
 )
-def normalize_endpoint(
+async def register_airport(payload: AirportRegister) -> AirportOut:
+    return await service.register_airport(payload.code, payload.timezone)
+
+
+@app.get("/airports", response_model=list[AirportOut], tags=["airports"], summary="列出全部机场")
+async def list_airports() -> list[AirportOut]:
+    return await service.list_airports()
+
+
+@app.patch(
+    "/airports/{code}/timezone",
+    response_model=RepartitionJobOut,
+    tags=["airports"],
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    summary="调整机场时区（后台重分区全部历史扫描）",
+)
+async def change_timezone(
+    payload: TimezoneChange = Body(
+        openapi_examples={
+            "to_chicago": {
+                "summary": "JFK 从 America/New_York 调整为 America/Chicago",
+                "value": DEMO_TZ_CHANGE,
+            }
+        }
+    ),
+    code: str = Path(..., min_length=1, max_length=16),
+) -> RepartitionJobOut:
+    return await service.change_timezone(code.upper(), payload.validated())
+
+
+@app.get(
+    "/airports/{code}/progress",
+    response_model=ProgressOut,
+    tags=["airports"],
+    responses={404: {"model": ErrorResponse}},
+    summary="机场总览：当前清单、扫描总数、重分区作业进度",
+)
+async def progress(code: str) -> dict:
+    return await service.get_progress(code.upper())
+
+
+@app.get(
+    "/airports/{code}/jobs",
+    response_model=list[RepartitionJobOut],
+    tags=["airports"],
+    summary="该机场全部重分区作业（含历史）",
+)
+async def list_jobs(code: str) -> list[RepartitionJobOut]:
+    return await service.list_jobs(code.upper())
+
+
+# ---------------------------------------------------------------------------
+# Ingestion
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/ingest",
+    response_model=IngestResponse,
+    tags=["ingest"],
+    responses={
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+    summary="接收一批扫描（最多 200 条），原始记录入 SQLite 并发布 Parquet 清单",
+)
+async def ingest(
     req: Annotated[
-        NormalizeRequest,
+        IngestRequest,
         Body(
             openapi_examples={
-                "dst_fallback_resolved": {
-                    "summary": "DST fall-back: constraints disambiguate, one record stays 待核对",
-                    "description": "2024-11-03 US fall-back. ARR_JFK 01:30 New York is ambiguous "
-                                   "(05:30Z/06:30Z); the 1-2h transfer window to DEP_JFK forces "
-                                   "06:30Z. XFR_ORD 01:30 Chicago keeps both candidates.",
-                    "value": DEMO_DST_FALLBACK,
+                "jfk_batch": {
+                    "summary": "JFK 一批 3 条 UTC 扫描（跨两个本地日）",
+                    "description": "成功后返回新版本号、时区、插入/去重计数和当前清单（含文件路径与校验和）。",
+                    "value": DEMO_INGEST,
                 },
-                "imaginary_local_time": {
-                    "summary": "Spring-forward gap: local time does not exist → 409",
-                    "description": "2024-03-10 02:30 never happened in America/New_York, so the "
-                                   "record has no legal UTC candidate.",
-                    "value": DEMO_IMAGINARY_TIME,
-                },
-                "conflicting_links": {
-                    "summary": "Mutually inconsistent links → 409 with irreducible conflict",
-                    "description": "A→B is fixed at 7200s but the link allows at most 3600s.",
-                    "value": DEMO_CONFLICTING_LINKS,
+                "retransmit_same_batch": {
+                    "summary": "同内容重传 → status=duplicate，不重复落湖",
+                    "value": DEMO_INGEST,
                 },
             }
         ),
     ],
-) -> NormalizeResponse | JSONResponse:
-    outcome = solver.normalize(
-        records=[solver.ScanInput(r.id, r.local_time, r.timezone) for r in req.records],
-        links=[solver.LinkInput(l.from_id, l.to_id, l.min_seconds, l.max_seconds) for l in req.links],
+) -> IngestResponse:
+    return await service.ingest_batch(req)
+
+
+# ---------------------------------------------------------------------------
+# Manifests & downloads
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/airports/{code}/manifests",
+    response_model=list[ManifestOut],
+    tags=["manifest"],
+    summary="列出该机场各时区版本的清单（当前 / 已废弃）",
+)
+async def list_manifests(code: str) -> list[ManifestOut]:
+    return await service.list_manifests(code.upper())
+
+
+@app.get(
+    "/airports/{code}/manifests/current",
+    response_model=ManifestOut,
+    tags=["manifest"],
+    responses={404: {"model": ErrorResponse}},
+    summary="当前文件清单（下游装载事实表的入口）",
+)
+async def current_manifest(code: str) -> ManifestOut:
+    return await service.get_current_manifest(code.upper())
+
+
+@app.get(
+    "/airports/{code}/download",
+    tags=["download"],
+    responses={404: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+    summary="下载当前清单的 Parquet：单文件直出，多文件打 zip（preserve / normalize）",
+)
+async def download(
+    code: str,
+    layout: Literal["preserve", "normalize"] = Query(
+        "preserve",
+        description="preserve=保留版本化目录结构；normalize=平铺为 local_date=YYYY-MM-DD 规范 Hive 布局",
+    ),
+    version: int | None = Query(None, ge=1, description="下载指定历史版本；默认当前版本"),
+) -> Response:
+    code = code.upper()
+    manifest = (
+        await service.get_current_manifest(code)
+        if version is None
+        else await service.get_manifest(code, version)
+    )
+    if not manifest.files:
+        raise HTTPException(status_code=404, detail="manifest has no files to download")
+    if len(manifest.files) == 1:
+        f = manifest.files[0]
+        try:
+            path = storage.resolve_file(f.relative_path)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return FileResponse(
+            path,
+            media_type="application/vnd.apache.parquet",
+            filename=path.name,
+        )
+    try:
+        pairs = [(f.relative_path, "") for f in manifest.files]
+        blob = storage.build_zip(pairs, layout=layout)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    suffix = "normalized" if layout == "normalize" else "preserved"
+    fname = f"{code.lower()}-v{manifest.version}-{suffix}.zip"
+    return Response(
+        content=blob,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
-    if isinstance(outcome, solver.NoLegalCandidate):
-        body = ErrorResponse(
-            error="no_legal_candidate",
-            message="Local time has no legal UTC reading under its timezone rules "
-                    "(it falls into a DST spring-forward gap). No partial conversion returned.",
-            invalid_records=[
-                InvalidRecordInfo(
-                    id=r.id,
-                    local_time=r.local_time,
-                    timezone=r.timezone,
-                    reason="local time does not exist in this timezone",
-                )
-                for r in outcome.records
-            ],
-        )
-        return JSONResponse(status_code=409, content=body.model_dump(mode="json"))
 
-    if isinstance(outcome, solver.NoGlobalSolution):
-        body = ErrorResponse(
-            error="no_global_solution",
-            message="Transfer links are mutually inconsistent: no assignment of UTC "
-                    "candidates satisfies every interval simultaneously. The listed "
-                    "links form an irreducible conflict. No partial conversion returned.",
-            conflicting_links=[
-                LinkInfo(
-                    index=i,
-                    from_id=req.links[i].from_id,
-                    to_id=req.links[i].to_id,
-                    min_seconds=req.links[i].min_seconds,
-                    max_seconds=req.links[i].max_seconds,
-                )
-                for i in outcome.link_indices
-            ],
-            involved_records=outcome.record_ids,
-        )
-        return JSONResponse(status_code=409, content=body.model_dump(mode="json"))
+@app.get(
+    "/files/download",
+    tags=["download"],
+    responses={404: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+    summary="按清单中的 relative_path 下载单个 Parquet 文件",
+)
+async def download_one(path: str = Query(..., description="清单文件中的 relative_path")) -> Response:
+    try:
+        p = storage.resolve_file(path)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(p, media_type="application/vnd.apache.parquet", filename=p.name)
 
-    by_id = {r.id: r for r in req.records}
-    records_out = [
-        RecordOut(
-            id=res.id,
-            timezone=by_id[res.id].timezone,
-            local_time=by_id[res.id].local_time,
-            status=res.status,
-            utc=res.candidates[0] if res.status == "determined" else None,
-            candidates=res.candidates,
-        )
-        for res in outcome.results
-    ]
-    return NormalizeResponse(
-        summary=Summary(
-            total=len(records_out),
-            determined=sum(1 for r in records_out if r.status == "determined"),
-            needs_review=sum(1 for r in records_out if r.status == "needs_review"),
-        ),
-        records=records_out,
+
+# ---------------------------------------------------------------------------
+# Error mapping
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(service.ServiceError)
+async def service_error_handler(_request, exc: service.ServiceError) -> Response:
+    return JSONResponse(
+        status_code=exc.status,
+        content=ErrorResponse(
+            error=exc.error, message=exc.message, details=exc.details
+        ).model_dump(mode="json"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test-only worker control (documented, harmless in production)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/debug/worker/{action}", include_in_schema=True, tags=["debug"])
+async def worker_control(
+    action: Literal["pause", "resume", "tick"],
+    until_state: Literal["pending", "running", "draining", "publishing", "done"] | None = None,
+) -> dict:
+    """Pause/resume the background repartition worker, or run iterations now.
+
+    ``until_state`` runs ticks until the newest job reaches the given state
+    (used by tests to freeze the pipeline at a deterministic phase).
+    """
+    if action == "pause":
+        service.worker_gate.clear()
+        return {"worker": "paused"}
+    if action == "resume":
+        service.worker_gate.set()
+        return {"worker": "resumed"}
+    ran = False
+    iterations = 0
+    while True:
+        ran_one = await service.process_one_job()
+        ran = ran or ran_one
+        iterations += 1
+        if until_state is None:
+            break
+        jobs = await service.list_jobs_for_debug()
+        state = jobs[0]["state"] if jobs else None
+        if state == until_state or state in ("done", "failed") or iterations > 500:
+            return {"worker": "tick", "job_processed": ran, "state": state, "iterations": iterations}
+        if not ran_one:
+            return {"worker": "tick", "job_processed": ran, "state": state, "iterations": iterations}
+    return {"worker": "tick", "job_processed": ran, "iterations": iterations}
+
+
+class CrashIngest(BaseModel):
+    airport: str
+    scan_id: str = "X1"
+    utc_ts: str = "2024-11-03T06:30:00Z"
+
+
+@app.post("/debug/crash/ingest", include_in_schema=True, tags=["debug"])
+async def crash_ingest(payload: CrashIngest) -> dict:
+    """Test aid: commit a raw scan + 'received' batch with no lake files.
+
+    Simulates a process killed after the SQLite commit but before the Parquet
+    manifest was published, so startup recovery can be exercised.
+    """
+    return await service.inject_crashed_ingest(
+        payload.airport.upper(), payload.scan_id, payload.utc_ts
     )

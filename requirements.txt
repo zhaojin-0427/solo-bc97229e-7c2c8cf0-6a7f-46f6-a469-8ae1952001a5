@@ -1,3 +1,6 @@
-fastapi==0.162.4
+fastapi==0.162.5
 uvicorn[standard]==0.54.0
+pydantic==2.14.3
+aiosqlite==0.22.1
+pyarrow==26.0.1
 tzdata==2026.6
